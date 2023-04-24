@@ -254,7 +254,7 @@ def main(args):
             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
+    trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
 
@@ -317,7 +317,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir:
+        if args.output_dir and epoch == args.epochs - 1:
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)

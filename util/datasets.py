@@ -29,8 +29,8 @@ def build_dataset(is_train, args):
 
 
 def build_transform(is_train, args):
-    mean = IMAGENET_DEFAULT_MEAN
-    std = IMAGENET_DEFAULT_STD
+    mean = [0.491, 0.482, 0.447]
+    std = [0.247, 0.243, 0.261]
     # train transform
     if is_train:
         # this should always dispatch to transforms_imagenet_train

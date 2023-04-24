@@ -70,7 +70,7 @@ def get_args_parser():
     parser.add_argument('--finetune', default='',
                         help='finetune from checkpoint')
     parser.add_argument('--global_pool', action='store_true')
-    parser.set_defaults(global_pool=False)
+    parser.set_defaults(global_pool=True)
     parser.add_argument('--cls_token', action='store_false', dest='global_pool',
                         help='Use class token instead of global pool for classification')
 
@@ -130,15 +130,15 @@ def main(args):
 
     # linear probe: weak augmentation
     transform_train = transforms.Compose([
-            RandomResizedCrop(224, interpolation=3),
+            RandomResizedCrop(32, interpolation=3),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
     transform_val = transforms.Compose([
-            transforms.Resize(256, interpolation=3),
-            transforms.CenterCrop(224),
+            transforms.Resize(int(32/224*256), interpolation=3),
+            transforms.CenterCrop(32),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
     print(dataset_train)
@@ -223,6 +223,7 @@ def main(args):
     # freeze all but the head
     for _, p in model.named_parameters():
         p.requires_grad = False
+        # print(_, p)
     for _, p in model.head.named_parameters():
         p.requires_grad = True
 
@@ -277,7 +278,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir:
+        if args.output_dir and epoch == args.epochs - 1:
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)

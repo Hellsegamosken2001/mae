@@ -21,6 +21,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import collections
 
 import timm
 
@@ -31,6 +32,7 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
+from models_mae import ModelEma
 
 from engine_pretrain import train_one_epoch
 
@@ -65,10 +67,10 @@ def get_args_parser():
                         help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
+    parser.add_argument('--min_lr', type=float, default=1e-5, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='epochs to warmup LR')
 
     # Dataset parameters
@@ -100,7 +102,9 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
-
+    parser.add_argument('--model_ema', action='store_true', default=False)
+    parser.add_argument('--model_ema_decay', type=float, default=0.999, help='the start ema decay')
+    
     return parser
 
 
@@ -124,7 +128,7 @@ def main(args):
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
@@ -156,8 +160,17 @@ def main(args):
     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
-
     model_without_ddp = model
+    
+    model_ema = None
+    if args.model_ema:
+        model_ema = ModelEma(
+            model,
+            decay = args.model_ema_decay,
+        )
+        print("Using EMA with decay = %.8f" % args.model_ema_decay)
+        
+    
     print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
@@ -182,18 +195,43 @@ def main(args):
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-
+    if args.model_ema:
+        model_ema.set(model_without_ddp)
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+    optimizer.state = collections.defaultdict(dict)
+    param_groups = optim_factory.add_weight_decay(model_without_ddp, 0.005)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    print(optimizer)
+    epoch1 = 0
     for epoch in range(args.start_epoch, args.epochs):
+        epoch1 += 1
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+            
+        construct_pixel = model_ema is None
+            
         train_stats = train_one_epoch(
             model, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
+            optimizer, device, epoch, epoch1, loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
+            model_ema=model_ema,
+            construct_pixel=construct_pixel
         )
+        
+        if args.model_ema:
+            # if epoch == 50:
+            #     model_ema.set(model)
+            #     print("emasetted")
+            # if epoch % 30 == 29 and epoch < 180:
+            model_ema.update(model)
+                # model_ema.set(model)
+                # epoch1 = 0
+                # param_groups = optim_factory.add_weight_decay(model.module, 0.05)
+                # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+                # print("updated")
+        
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,

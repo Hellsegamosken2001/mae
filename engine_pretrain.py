@@ -13,6 +13,10 @@ import sys
 from typing import Iterable
 
 import torch
+import timm
+
+assert timm.__version__ == "0.3.2"  # version check
+import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
 import util.lr_sched as lr_sched
@@ -20,8 +24,8 @@ import util.lr_sched as lr_sched
 
 def train_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler,
-                    log_writer=None,
+                    device: torch.device, epoch: int, epoch1, loss_scaler, model_ema=None,
+                    log_writer=None, construct_pixel=True,
                     args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -36,17 +40,29 @@ def train_one_epoch(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
+    LN = torch.nn.LayerNorm(model.module.embed_dim, eps=1e-6, elementwise_affine=False).cuda()
+    
     for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch1, args)
 
         samples = samples.to(device, non_blocking=True)
+        # print(construct_pixel)
+        if construct_pixel:
+            with torch.cuda.amp.autocast():
+                loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
-        with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
-
+        else:
+            with torch.no_grad():
+                model_ema.module.eval()
+                feat = model_ema.module.get_feature(samples)
+                
+            with torch.cuda.amp.autocast():
+                loss, _, _ = model(samples, mask_ratio=args.mask_ratio, feat_target=feat)
+            # loss = torch.mean((LN(feat) - LN(pred))**2)
+        
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -58,7 +74,7 @@ def train_one_epoch(model: torch.nn.Module,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
-
+        # print(data_iter_step)
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
@@ -74,7 +90,7 @@ def train_one_epoch(model: torch.nn.Module,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
-
+            
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
