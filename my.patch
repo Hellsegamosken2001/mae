@@ -1,0 +1,622 @@
+diff --git a/engine_pretrain.py b/engine_pretrain.py
+index 4ea0d13..84fc59c 100644
+--- a/engine_pretrain.py
++++ b/engine_pretrain.py
+@@ -13,6 +13,10 @@ import sys
+ from typing import Iterable
+ 
+ import torch
++import timm
++
++assert timm.__version__ == "0.3.2"  # version check
++import timm.optim.optim_factory as optim_factory
+ 
+ import util.misc as misc
+ import util.lr_sched as lr_sched
+@@ -20,8 +24,8 @@ import util.lr_sched as lr_sched
+ 
+ def train_one_epoch(model: torch.nn.Module,
+                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
+-                    device: torch.device, epoch: int, loss_scaler,
+-                    log_writer=None,
++                    device: torch.device, epoch: int, epoch1, loss_scaler, model_ema=None,
++                    log_writer=None, construct_pixel=True,
+                     args=None):
+     model.train(True)
+     metric_logger = misc.MetricLogger(delimiter="  ")
+@@ -36,17 +40,29 @@ def train_one_epoch(model: torch.nn.Module,
+     if log_writer is not None:
+         print('log_dir: {}'.format(log_writer.log_dir))
+ 
++    LN = torch.nn.LayerNorm(model.module.embed_dim, eps=1e-6, elementwise_affine=False).cuda()
++    
+     for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+ 
+         # we use a per iteration (instead of per epoch) lr scheduler
+         if data_iter_step % accum_iter == 0:
+-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
++            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch1, args)
+ 
+         samples = samples.to(device, non_blocking=True)
+-
+-        with torch.cuda.amp.autocast():
+-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+-
++        # print(construct_pixel)
++        if construct_pixel:
++            with torch.cuda.amp.autocast():
++                loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
++
++        else:
++            with torch.no_grad():
++                model_ema.module.eval()
++                feat = model_ema.module.get_feature(samples)
++                
++            with torch.cuda.amp.autocast():
++                loss, _, _ = model(samples, mask_ratio=args.mask_ratio, feat_target=feat)
++            # loss = torch.mean((LN(feat) - LN(pred))**2)
++        
+         loss_value = loss.item()
+ 
+         if not math.isfinite(loss_value):
+@@ -58,7 +74,7 @@ def train_one_epoch(model: torch.nn.Module,
+                     update_grad=(data_iter_step + 1) % accum_iter == 0)
+         if (data_iter_step + 1) % accum_iter == 0:
+             optimizer.zero_grad()
+-
++        # print(data_iter_step)
+         torch.cuda.synchronize()
+ 
+         metric_logger.update(loss=loss_value)
+@@ -74,7 +90,7 @@ def train_one_epoch(model: torch.nn.Module,
+             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
+             log_writer.add_scalar('lr', lr, epoch_1000x)
+-
++            
+ 
+     # gather the stats from all processes
+     metric_logger.synchronize_between_processes()
+diff --git a/main_finetune.py b/main_finetune.py
+index c3b3ab7..c4e872c 100644
+--- a/main_finetune.py
++++ b/main_finetune.py
+@@ -254,7 +254,7 @@ def main(args):
+             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+ 
+         # manually initialize fc layer
+-        trunc_normal_(model.head.weight, std=2e-5)
++    trunc_normal_(model.head.weight, std=2e-5)
+ 
+     model.to(device)
+ 
+@@ -317,7 +317,7 @@ def main(args):
+             log_writer=log_writer,
+             args=args
+         )
+-        if args.output_dir:
++        if args.output_dir and epoch == args.epochs - 1:
+             misc.save_model(
+                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                 loss_scaler=loss_scaler, epoch=epoch)
+diff --git a/main_linprobe.py b/main_linprobe.py
+index 2d3f241..db7932f 100644
+--- a/main_linprobe.py
++++ b/main_linprobe.py
+@@ -70,7 +70,7 @@ def get_args_parser():
+     parser.add_argument('--finetune', default='',
+                         help='finetune from checkpoint')
+     parser.add_argument('--global_pool', action='store_true')
+-    parser.set_defaults(global_pool=False)
++    parser.set_defaults(global_pool=True)
+     parser.add_argument('--cls_token', action='store_false', dest='global_pool',
+                         help='Use class token instead of global pool for classification')
+ 
+@@ -130,15 +130,15 @@ def main(args):
+ 
+     # linear probe: weak augmentation
+     transform_train = transforms.Compose([
+-            RandomResizedCrop(224, interpolation=3),
++            RandomResizedCrop(32, interpolation=3),
+             transforms.RandomHorizontalFlip(),
+             transforms.ToTensor(),
+-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
++            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
+     transform_val = transforms.Compose([
+-            transforms.Resize(256, interpolation=3),
+-            transforms.CenterCrop(224),
++            transforms.Resize(int(32/224*256), interpolation=3),
++            transforms.CenterCrop(32),
+             transforms.ToTensor(),
+-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
++            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
+     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+     dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+     print(dataset_train)
+@@ -223,6 +223,7 @@ def main(args):
+     # freeze all but the head
+     for _, p in model.named_parameters():
+         p.requires_grad = False
++        # print(_, p)
+     for _, p in model.head.named_parameters():
+         p.requires_grad = True
+ 
+@@ -277,7 +278,7 @@ def main(args):
+             log_writer=log_writer,
+             args=args
+         )
+-        if args.output_dir:
++        if args.output_dir and epoch == args.epochs - 1:
+             misc.save_model(
+                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                 loss_scaler=loss_scaler, epoch=epoch)
+diff --git a/main_pretrain.py b/main_pretrain.py
+index 58a18c5..d8a0142 100644
+--- a/main_pretrain.py
++++ b/main_pretrain.py
+@@ -21,6 +21,7 @@ import torch.backends.cudnn as cudnn
+ from torch.utils.tensorboard import SummaryWriter
+ import torchvision.transforms as transforms
+ import torchvision.datasets as datasets
++import collections
+ 
+ import timm
+ 
+@@ -31,6 +32,7 @@ import util.misc as misc
+ from util.misc import NativeScalerWithGradNormCount as NativeScaler
+ 
+ import models_mae
++from models_mae import ModelEma
+ 
+ from engine_pretrain import train_one_epoch
+ 
+@@ -65,10 +67,10 @@ def get_args_parser():
+                         help='learning rate (absolute lr)')
+     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
+-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
++    parser.add_argument('--min_lr', type=float, default=1e-5, metavar='LR',
+                         help='lower lr bound for cyclic schedulers that hit 0')
+ 
+-    parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
++    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
+                         help='epochs to warmup LR')
+ 
+     # Dataset parameters
+@@ -100,7 +102,9 @@ def get_args_parser():
+     parser.add_argument('--dist_on_itp', action='store_true')
+     parser.add_argument('--dist_url', default='env://',
+                         help='url used to set up distributed training')
+-
++    parser.add_argument('--model_ema', action='store_true', default=False)
++    parser.add_argument('--model_ema_decay', type=float, default=0.999, help='the start ema decay')
++    
+     return parser
+ 
+ 
+@@ -124,7 +128,7 @@ def main(args):
+             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+             transforms.RandomHorizontalFlip(),
+             transforms.ToTensor(),
+-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
++            transforms.Normalize(mean=[0.491, 0.482, 0.447], std=[0.247, 0.243, 0.261])])
+     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+     print(dataset_train)
+ 
+@@ -156,8 +160,17 @@ def main(args):
+     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+ 
+     model.to(device)
+-
+     model_without_ddp = model
++    
++    model_ema = None
++    if args.model_ema:
++        model_ema = ModelEma(
++            model,
++            decay = args.model_ema_decay,
++        )
++        print("Using EMA with decay = %.8f" % args.model_ema_decay)
++        
++    
+     print("Model = %s" % str(model_without_ddp))
+ 
+     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
+@@ -182,18 +195,43 @@ def main(args):
+     loss_scaler = NativeScaler()
+ 
+     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+-
++    if args.model_ema:
++        model_ema.set(model_without_ddp)
+     print(f"Start training for {args.epochs} epochs")
+     start_time = time.time()
++    optimizer.state = collections.defaultdict(dict)
++    param_groups = optim_factory.add_weight_decay(model_without_ddp, 0.005)
++    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
++    print(optimizer)
++    epoch1 = 0
+     for epoch in range(args.start_epoch, args.epochs):
++        epoch1 += 1
+         if args.distributed:
+             data_loader_train.sampler.set_epoch(epoch)
++            
++        construct_pixel = model_ema is None
++            
+         train_stats = train_one_epoch(
+             model, data_loader_train,
+-            optimizer, device, epoch, loss_scaler,
++            optimizer, device, epoch, epoch1, loss_scaler,
+             log_writer=log_writer,
+-            args=args
++            args=args,
++            model_ema=model_ema,
++            construct_pixel=construct_pixel
+         )
++        
++        if args.model_ema:
++            # if epoch == 50:
++            #     model_ema.set(model)
++            #     print("emasetted")
++            # if epoch % 30 == 29 and epoch < 180:
++            model_ema.update(model)
++                # model_ema.set(model)
++                # epoch1 = 0
++                # param_groups = optim_factory.add_weight_decay(model.module, 0.05)
++                # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
++                # print("updated")
++        
+         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+             misc.save_model(
+                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+diff --git a/models_mae.py b/models_mae.py
+index 880e28f..c5c8a1f 100644
+--- a/models_mae.py
++++ b/models_mae.py
+@@ -12,12 +12,62 @@
+ from functools import partial
+ 
+ import torch
++import numpy as np
+ import torch.nn as nn
++import copy
+ 
+ from timm.models.vision_transformer import PatchEmbed, Block
+ 
+ from util.pos_embed import get_2d_sincos_pos_embed
+ 
++class ModelEma(nn.Module):
++    """ modified from https://github.com/rwightman/pytorch-image-models
++    
++    Model Exponential Moving Average V2
++
++    Keep a moving average of everything in the model state_dict (parameters and buffers).
++    V2 of this module is simpler, it does not match params/buffers based on name but simply
++    iterates in order. It works with torchscript (JIT of full model).
++
++    This is intended to allow functionality like
++    https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
++
++    A smoothed version of the weights is necessary for some training schemes to perform well.
++    E.g. Google's hyper-params for training MNASNet, MobileNet-V3, EfficientNet, etc that use
++    RMSprop with a short 2.4-3 epoch decay period and slow LR decay rate of .96-.99 requires EMA
++    smoothing of weights to match results. Pay attention to the decay constant you are using
++    relative to your update count per epoch.
++
++    To keep EMA from using GPU resources, set device='cpu'. This will save a bit of memory but
++    disable validation of the EMA weights. Validation will have to be done manually in a separate
++    process, or after the training stops converging.
++
++    This class is sensitive where it is initialized in the sequence of model init,
++    GPU assignment and distributed training wrappers.
++    """
++    def __init__(self, model, decay=0.9999, device=None):
++        super(ModelEma, self).__init__()
++        # make a copy of the model for accumulating moving average of weights
++        self.module = copy.deepcopy(model)
++        self.module.eval()
++        self.decay = decay
++        self.device = device  # perform ema on different device from model if set
++        if self.device is not None:
++            self.module.to(device=device)
++
++    def _update(self, model, update_fn):
++        with torch.no_grad():
++            for ema_v, model_v in zip(self.module.state_dict().values(), model.state_dict().values()):
++                if self.device is not None:
++                    model_v = model_v.to(device=self.device)
++                ema_v.copy_(update_fn(ema_v, model_v))
++
++    def update(self, model):
++        self._update(model, update_fn=lambda e, m: self.decay * e + (1. - self.decay) * m)
++
++    def set(self, model):
++        self._update(model, update_fn=lambda e, m: m)
++
+ 
+ class MaskedAutoencoderViT(nn.Module):
+     """ Masked Autoencoder with VisionTransformer backbone
+@@ -27,7 +77,7 @@ class MaskedAutoencoderViT(nn.Module):
+                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
+         super().__init__()
+-
++        self.embed_dim = embed_dim
+         # --------------------------------------------------------------------------
+         # MAE encoder specifics
+         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+@@ -41,25 +91,35 @@ class MaskedAutoencoderViT(nn.Module):
+             for i in range(depth)])
+         self.norm = norm_layer(embed_dim)
+         # --------------------------------------------------------------------------
+-
++        
++        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+         # --------------------------------------------------------------------------
+-        # MAE decoder specifics
+-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+-
+-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
++        # Pixel Regressor
++        self.pdecoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+ 
+-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
++        self.pmask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+ 
+-        self.decoder_blocks = nn.ModuleList([
++        self.pdecoder_blocks = nn.ModuleList([
+             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+             for i in range(decoder_depth)])
+ 
+-        self.decoder_norm = norm_layer(decoder_embed_dim)
+-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
++        self.pdecoder_norm = norm_layer(decoder_embed_dim)
++        self.pdecoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
+         # --------------------------------------------------------------------------
+ 
+-        self.norm_pix_loss = norm_pix_loss
++        # Feature Predictor
++        self.fdecoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+ 
++        self.fmask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
++        
++        self.fdecoder_blocks = nn.ModuleList([
++            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
++            for i in range(decoder_depth)])
++
++        self.fdecoder_norm = norm_layer(decoder_embed_dim)
++        # --------------------------------------------------------------------------
++        self.norm_pix_loss = norm_pix_loss
++        
+         self.initialize_weights()
+ 
+     def initialize_weights(self):
+@@ -77,7 +137,8 @@ class MaskedAutoencoderViT(nn.Module):
+ 
+         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+         torch.nn.init.normal_(self.cls_token, std=.02)
+-        torch.nn.init.normal_(self.mask_token, std=.02)
++        torch.nn.init.normal_(self.pmask_token, std=.02)
++        torch.nn.init.normal_(self.fmask_token, std=.02)
+ 
+         # initialize nn.Linear and nn.LayerNorm
+         self.apply(self._init_weights)
+@@ -169,12 +230,12 @@ class MaskedAutoencoderViT(nn.Module):
+ 
+         return x, mask, ids_restore
+ 
+-    def forward_decoder(self, x, ids_restore):
++    def forward_pdecoder(self, x, ids_restore):
+         # embed tokens
+-        x = self.decoder_embed(x)
++        x = self.pdecoder_embed(x)
+ 
+         # append mask tokens to sequence
+-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
++        mask_tokens = self.pmask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+         x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+         x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+@@ -183,19 +244,42 @@ class MaskedAutoencoderViT(nn.Module):
+         x = x + self.decoder_pos_embed
+ 
+         # apply Transformer blocks
+-        for blk in self.decoder_blocks:
++        for blk in self.pdecoder_blocks:
+             x = blk(x)
+-        x = self.decoder_norm(x)
++        x = self.pdecoder_norm(x)
+ 
+         # predictor projection
+-        x = self.decoder_pred(x)
++        x = self.pdecoder_pred(x)
++
++        # remove cls token
++        x = x[:, 1:, :]
++
++        return x
++    
++    def forward_fdecoder(self, x, ids_restore):
++        # embed tokens
++        x = self.fdecoder_embed(x)
++
++        # append mask tokens to sequence
++        mask_tokens = self.fmask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
++        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
++        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
++        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
++
++        # add pos embed
++        x = x + self.decoder_pos_embed
++
++        # apply Transformer blocks
++        for blk in self.fdecoder_blocks:
++            x = blk(x)
++        x = self.fdecoder_norm(x)
+ 
+         # remove cls token
+         x = x[:, 1:, :]
+ 
+         return x
+ 
+-    def forward_loss(self, imgs, pred, mask):
++    def pixel_loss(self, imgs, pred, mask):
+         """
+         imgs: [N, 3, H, W]
+         pred: [N, L, p*p*3]
+@@ -212,13 +296,65 @@ class MaskedAutoencoderViT(nn.Module):
+ 
+         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+         return loss
++    
++    def feat_loss(self, feat, pred, mask):
++        if self.norm_pix_loss:
++            mean = feat.mean(dim=-1, keepdim=True)
++            var = feat.var(dim=-1, keepdim=True)
++            feat = (feat - mean) / (var + 1.e-6)**.5
++
++        loss = (pred - feat) ** 2
++        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
++
++        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
++        return loss
+ 
+-    def forward(self, imgs, mask_ratio=0.75):
++    def forward(self, imgs, mask_ratio=0.75, feat_target=None):
+         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+-        loss = self.forward_loss(imgs, pred, mask)
+-        return loss, pred, mask
++        pred = self.forward_pdecoder(latent, ids_restore)  # [N, L, p*p*3]
++        loss_p = self.pixel_loss(imgs, pred, mask)
++        
++        loss_f = 0
++        if feat_target is not None:
++            feat = self.forward_fdecoder(latent, ids_restore)
++            loss_f = self.feat_loss(feat_target, feat, mask)
++            
++        return loss_p*0 + loss_f * 5, pred, mask
++            
++    def knorm(self, target):
++        mean = target.mean(dim=-1, keepdim=True)
++        var = target.var(dim=-1, keepdim=True)
++        target = (target - mean) / (var + 1.e-6)**.5
++        return target
++        
++    def get_feature(self, x):
++        x = self.patch_embed(x)
++        x = x + self.pos_embed[:, 1:, :]
++        cls_token = self.cls_token + self.pos_embed[:, :1, :]
++        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
++        x = torch.cat((cls_tokens, x), dim=1)
++        blks = []
++        for blk in self.blocks:
++            x = blk(x)
++            blks.append(self.knorm(x))
++        x = self.norm(x)
++        # x = sum(blks[-1:])/1
++        #-----
++        # x = self.fdecoder_embed(x)
+ 
++        # x = x + self.decoder_pos_embed
++        
++        # for blk in self.fdecoder_blocks:
++        #     x = blk(x)
++        #     blks.append(self.knorm(x))
++        # x = self.fdecoder_norm(x)
++        # x = sum(blks[-2:])/2
++        #------
++        x = x[:, 1:, :]
++
++        return x
++
++        # return x[:,1:]
+ 
+ def mae_vit_base_patch16_dec512d8b(**kwargs):
+     model = MaskedAutoencoderViT(
+@@ -243,8 +379,40 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
+         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+     return model
+ 
++def mae_deit_tiny_patch4_dec192d8b(**kwargs):
++    model = MaskedAutoencoderViT(
++        img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3,
++        decoder_embed_dim=192, decoder_depth=8, decoder_num_heads=8,
++        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++def mae_deit_tiny_patch4_dec192d4b(**kwargs):
++    model = MaskedAutoencoderViT(
++        img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3,
++        decoder_embed_dim=192, decoder_depth=4, decoder_num_heads=8,
++        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++def mae_deit_tiny_patch4_dec192d2b(**kwargs):
++    model = MaskedAutoencoderViT(
++        img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3,
++        decoder_embed_dim=192, decoder_depth=2, decoder_num_heads=8,
++        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++def mae_deit_tiny_patch4_dec192d1b(**kwargs):
++    model = MaskedAutoencoderViT(
++        img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3,
++        decoder_embed_dim=192, decoder_depth=1, decoder_num_heads=8,
++        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
+ 
+ # set recommended archs
+ mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
+ mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
+ mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
++mae_deit_tiny_patch4 = mae_deit_tiny_patch4_dec192d1b
++mae_deit_tiny_patch42 = mae_deit_tiny_patch4_dec192d2b
++mae_deit_tiny_patch44 = mae_deit_tiny_patch4_dec192d4b
++mae_deit_tiny_patch48 = mae_deit_tiny_patch4_dec192d8b
+\ No newline at end of file
+diff --git a/models_vit.py b/models_vit.py
+index 2244a17..5dfe039 100644
+--- a/models_vit.py
++++ b/models_vit.py
+@@ -71,4 +71,10 @@ def vit_huge_patch14(**kwargs):
+     model = VisionTransformer(
+         patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
+         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
++    return model
++
++def deit_tiny_patch4(**kwargs):
++    model = VisionTransformer(
++        img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
++        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+     return model
+\ No newline at end of file
+diff --git a/util/datasets.py b/util/datasets.py
+index 0dde1f4..1239b5b 100644
+--- a/util/datasets.py
++++ b/util/datasets.py
+@@ -29,8 +29,8 @@ def build_dataset(is_train, args):
+ 
+ 
+ def build_transform(is_train, args):
+-    mean = IMAGENET_DEFAULT_MEAN
+-    std = IMAGENET_DEFAULT_STD
++    mean = [0.491, 0.482, 0.447]
++    std = [0.247, 0.243, 0.261]
+     # train transform
+     if is_train:
+         # this should always dispatch to transforms_imagenet_train
+diff --git a/util/lr_sched.py b/util/lr_sched.py
+index 4cb682b..becb3b0 100644
+--- a/util/lr_sched.py
++++ b/util/lr_sched.py
+@@ -12,7 +12,7 @@ def adjust_learning_rate(optimizer, epoch, args):
+         lr = args.lr * epoch / args.warmup_epochs 
+     else:
+         lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * \
+-            (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
++            (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (2000 - args.warmup_epochs)))
+     for param_group in optimizer.param_groups:
+         if "lr_scale" in param_group:
+             param_group["lr"] = lr * param_group["lr_scale"]

@@ -224,9 +224,15 @@ def main(args):
             # if epoch == 50:
             #     model_ema.set(model)
             #     print("emasetted")
-            # if epoch % 30 == 29 and epoch < 180:
-            model_ema.update(model)
-                # model_ema.set(model)
+            if epoch % 30 == 29 and epoch < 180:
+                model_ema.set(model)
+            # if epoch <= 100:
+            #     model_ema.decay = (0.992-0.98)*epoch/100 + 0.98
+            # else:
+            #     model_ema.decay = 0.992
+            # model_ema.update(model)
+            
+                
                 # epoch1 = 0
                 # param_groups = optim_factory.add_weight_decay(model.module, 0.05)
                 # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))

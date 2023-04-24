@@ -311,15 +311,17 @@ class MaskedAutoencoderViT(nn.Module):
 
     def forward(self, imgs, mask_ratio=0.75, feat_target=None):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
-        pred = self.forward_pdecoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss_p = self.pixel_loss(imgs, pred, mask)
         
-        loss_f = 0
         if feat_target is not None:
             feat = self.forward_fdecoder(latent, ids_restore)
             loss_f = self.feat_loss(feat_target, feat, mask)
+            return loss_f*5 , feat, mask
+        else:
+            pred = self.forward_pdecoder(latent, ids_restore)  # [N, L, p*p*3]
+            loss_p = self.pixel_loss(imgs, pred, mask)
+            return loss_p , pred, mask
             
-        return loss_p*0 + loss_f * 5, pred, mask
+        
             
     def knorm(self, target):
         mean = target.mean(dim=-1, keepdim=True)
